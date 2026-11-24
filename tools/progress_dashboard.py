@@ -265,9 +265,12 @@ def ci_test_files():
 
 
 def run_one_test(rel, timeout):
+    before = file_digest(rel)
     t0 = time.monotonic()
     try:
         r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, rel)], cwd=ROOT, capture_output=True, timeout=timeout)
+        # An edit during the subprocess must not attach the new file's digest to the old result.
+        after = file_digest(rel)
         out = (r.stdout + r.stderr).decode("utf-8", "replace")
         skipped = re.search(r"^OK \(skipped=(\d+)\)\r?$", out, re.M)
         res = "pass" if r.returncode == 0 else "fail"
@@ -275,9 +278,11 @@ def run_one_test(rel, timeout):
         ran = re.search(r"Ran (\d+) tests?", out)
         cases = int(ran.group(1)) if ran else None
         return {"test": rel, "result": res, "seconds": round(time.monotonic() - t0, 2), "detail": tail,
-                "cases": cases, "all_skipped": bool(skipped and cases == int(skipped.group(1)))}
+                "cases": cases, "all_skipped": bool(skipped and cases == int(skipped.group(1))),
+                "digest": before if before == after else None}
     except subprocess.TimeoutExpired:
-        return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s"}
+        return {"test": rel, "result": "fail", "seconds": timeout, "detail": f"timed out after {timeout} s",
+                "digest": None}
 
 
 CODE_DIRS = ("tools", "scripts", "runtime/test/shaders")
@@ -308,8 +313,6 @@ def run_unit_tests(files, jobs, timeout):
     before = code_digest()
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         results = list(pool.map(lambda f: run_one_test(f, timeout), files))
-    for r in results:
-        r["digest"] = file_digest(r["test"])
     g = git_info()
     after = code_digest()
     return {"ran_at": iso(now_utc()), "commit": g.get("head"), "modified_files": g.get("modified_files"),
@@ -344,10 +347,11 @@ def collect_unit(col, out_dir, args):
         else:
             fresh = "revalidation_required"
         status = {"pass": "verified", "fail": "failed"}.get(r["result"], "unknown")
-        if r["result"] == "pass" and r.get("all_skipped"):
-            status = "unknown"
-        if status == "verified" and fresh == "revalidation_required":
-            status = "partial"
+        if status == "verified":
+            if r.get("all_skipped") or fresh == "unknown":
+                status = "unknown"
+            elif fresh == "revalidation_required":
+                status = "partial"
         passed += r["result"] == "pass"
         current += status == "verified"
         name = test.split("/", 1)[-1]

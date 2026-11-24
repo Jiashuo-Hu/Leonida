@@ -169,29 +169,31 @@ class Tests(unittest.TestCase):
 
 
 class Freshness(unittest.TestCase):
-    def collect(self, results):
+    def assert_unit_report(self, results, status, freshness):
         with tempfile.TemporaryDirectory() as out:
             with open(os.path.join(out, "unit_results.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(results, f)
             col = pd.Collector()
-            pd.collect_unit(col, out, type("A", (), {"run_tests": False})())
-            return {c["name"]: (c["status"], c["freshness"]) for c in col.components}
+            pd.collect_unit(col, out, SimpleNamespace(run_tests=False))
+        self.assertEqual([(c["name"], c["status"], c["freshness"]) for c in col.components],
+                         [("test_progress_dashboard.py", status, freshness)])
+        self.assertEqual({m["id"]: (m["numerator"], m["denominator"]) for m in col.metrics},
+                         {"tests.passed": (1, 1), "tests.current": (int(status == "verified"), 1)})
 
     def base(self, digest, code):
         return {"ran_at": "2026-11-22T10:00:00Z", "commit": None, "code_digest": code,
                 "results": [{"test": "tests/test_progress_dashboard.py", "result": "pass", "digest": digest}]}
 
     def test_unchanged_test_and_code_is_current(self):
-        got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), pd.code_digest()))
-        self.assertEqual(got["test_progress_dashboard.py"], ("verified", "current"))
+        data = self.base(pd.file_digest("tests/test_progress_dashboard.py"), pd.code_digest())
+        self.assert_unit_report(data, "verified", "current")
 
     def test_changed_test_file_needs_revalidation(self):
-        got = self.collect(self.base("0" * 16, pd.code_digest()))
-        self.assertEqual(got["test_progress_dashboard.py"], ("partial", "revalidation_required"))
+        self.assert_unit_report(self.base("0" * 16, pd.code_digest()), "partial", "revalidation_required")
 
     def test_changed_tools_need_revalidation(self):
-        got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), "0" * 16))
-        self.assertEqual(got["test_progress_dashboard.py"], ("partial", "revalidation_required"))
+        data = self.base(pd.file_digest("tests/test_progress_dashboard.py"), "0" * 16)
+        self.assert_unit_report(data, "partial", "revalidation_required")
 
     def test_changed_shader_helper_needs_revalidation(self):
         with tempfile.TemporaryDirectory() as root, mock.patch.object(pd, "ROOT", root):
@@ -202,14 +204,35 @@ class Freshness(unittest.TestCase):
             helper = Path(root, "runtime/test/shaders/compute_fixture.py")
             helper.write_bytes(b"shift = 0\n")
             cached = self.base(pd.file_digest(test), pd.code_digest())
-            self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("verified", "current"))
+            self.assert_unit_report(cached, "verified", "current")
 
             helper.write_bytes(b"shift = 1\n")
-            self.assertEqual(self.collect(cached)["test_progress_dashboard.py"], ("partial", "revalidation_required"))
+            self.assert_unit_report(cached, "partial", "revalidation_required")
 
     def test_code_edited_during_the_run_is_never_current(self):
-        got = self.collect(self.base(pd.file_digest("tests/test_progress_dashboard.py"), None))
-        self.assertEqual(got["test_progress_dashboard.py"], ("verified", "unknown"))
+        data = self.base(pd.file_digest("tests/test_progress_dashboard.py"), None)
+        self.assert_unit_report(data, "unknown", "unknown")
+
+    def test_legacy_pass_without_a_test_digest_is_never_current(self):
+        data = self.base(None, pd.code_digest())
+        del data["results"][0]["digest"]
+        self.assert_unit_report(data, "unknown", "unknown")
+
+    def test_test_edited_during_the_run_has_no_digest(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(pd, "ROOT", root), \
+                mock.patch.object(pd, "code_digest", return_value="code"), \
+                mock.patch.object(pd, "git_info", return_value={}):
+            test = Path(root, "test_sample.py")
+            test.write_bytes(b"# before\n")
+
+            def edit_test(command, **_kwargs):
+                test.write_bytes(b"# after\n")
+                return subprocess.CompletedProcess(command, 0, b"", b"Ran 1 test\n\nOK\n")
+
+            with mock.patch.object(pd.subprocess, "run", side_effect=edit_test):
+                data = pd.run_unit_tests([test.name], jobs=1, timeout=15)
+            self.assertEqual(data["results"][0]["result"], "pass")
+            self.assertIsNone(data["results"][0]["digest"])
 
     def test_ctest_junit_passes_age_like_lasttest_log(self):
         ctest_suite = '<testsuite disabled="0" hostname="" timestamp="2026-11-22T10:00:00">{}</testsuite>'
